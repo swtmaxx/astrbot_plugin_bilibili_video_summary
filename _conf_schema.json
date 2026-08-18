@@ -1,0 +1,42 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用自然语言视频总结工具",
+    "default": true
+  },
+  "provider_id": {
+    "type": "string",
+    "description": "用于生成总结的模型提供商",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "sessdata": {
+    "type": "string",
+    "description": "Bilibili SESSDATA（可选）",
+    "hint": "可填写纯 SESSDATA 值，也可粘贴完整 Cookie。遇到 -352、-412 风控或受限字幕时配置有效的登录 Cookie。请勿在日志或聊天消息中泄露。",
+    "default": ""
+  },
+  "summary_prompt": {
+    "type": "text",
+    "description": "完整自定义总结提示词模板",
+    "hint": "插件不会额外添加固定 system prompt；全部字幕会一次性替换到 {{subtitles}}。支持 {{video_title}}、{{video_description}}、{{video_published_at}}、{{video_duration}}、{{video_parts}}、{{subtitles}} 和 {{user_request}} 等占位符。",
+    "default": "请根据以下 Bilibili 视频信息和全部字幕生成总结。\n\n用户额外要求：{{user_request}}\n\n视频信息：\n{{video_metadata}}\n\n视频分P：\n{{video_parts}}\n\n全部字幕：\n{{subtitles}}\n\n请用中文输出视频主题、主要内容、重要结论和待办事项，使用清晰的小标题。必须以字幕和视频信息为依据，不要补写没有依据的事实，也不要逐句复述字幕。"
+  },
+  "request_interval_seconds": {
+    "type": "float",
+    "description": "Bilibili 请求之间的最小间隔（秒）",
+    "default": 1.5
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "单次 Bilibili 请求超时时间（秒）",
+    "hint": "范围为 1 到 300；这只控制 Bilibili 请求，不控制模型服务的超时。",
+    "default": 30
+  },
+  "max_concurrent_jobs": {
+    "type": "int",
+    "description": "最大并发总结任务数",
+    "hint": "全部字幕会一次性发送给模型，建议保持为 1。",
+    "default": 1
+  }
+}
