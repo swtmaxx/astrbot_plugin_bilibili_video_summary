@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
+import json
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -15,6 +17,11 @@ import aiohttp
 
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.core.utils.session_waiter import (
+    FILTERS,
+    DefaultSessionFilter,
+    SessionWaiter,
+)
 
 
 VIDEO_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
@@ -51,6 +58,18 @@ PROMPT_TEMPLATE_SIMPLE_MARKER_RE = re.compile(
 )
 PROMPT_TEMPLATE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(?P<template>.*?)```", re.DOTALL)
 MAX_PROMPT_TEMPLATE_LENGTH = 8000
+MAX_CONFIGURED_PROMPT_TEMPLATES = 30
+MAX_PROMPT_TEMPLATE_NAME_LENGTH = 100
+FOLLOWUP_TIMEOUT_SECONDS = 30 * 60
+FOLLOWUP_EXIT_PHRASES = frozenset(
+    {
+        "结束追问",
+        "结束提问",
+        "清除视频上下文",
+        "忘记这个视频",
+        "退出追问",
+    }
+)
 
 # Bilibili's documented WBI mixin-key permutation.
 WBI_MIXIN_KEY_TABLE = [
@@ -322,6 +341,12 @@ class VideoTranscript:
     @property
     def subtitle_count(self) -> int:
         return sum(len(page.tracks) for page in self.pages)
+
+
+@dataclass(frozen=True)
+class FollowupContext:
+    transcript: VideoTranscript
+    summary: str
 
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
@@ -616,8 +641,11 @@ class Main(star.Star):
         self._client_signature: tuple[str, float, int] | None = None
         self._jobs: dict[str, asyncio.Task[None]] = {}
         self._jobs_lock = asyncio.Lock()
+        self._followup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._followup_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
+        await self._migrate_prompt_template_config()
         errors = self._configuration_errors()
         if errors:
             logger.warning(
@@ -625,6 +653,40 @@ class Main(star.Star):
             )
         else:
             logger.info("Bilibili 视频总结自然语言工具已加载。")
+
+    async def _migrate_prompt_template_config(self) -> None:
+        """Convert legacy JSON templates to AstrBot's native template_list shape."""
+        raw = self._config_value("prompt_templates", None)
+        if raw in (None, "", [], {}):
+            return
+        if isinstance(raw, list) and all(
+            isinstance(item, dict)
+            and item.get("__template_key") == "summary"
+            and str(item.get("name") or "").strip()
+            and str(item.get("prompt") or "").strip()
+            for item in raw
+        ):
+            return
+
+        entries = self._configured_prompt_template_entries()
+        if not entries:
+            return
+        normalized = [
+            {
+                "__template_key": "summary",
+                "name": entry["name"],
+                "prompt": entry["prompt"],
+            }
+            for entry in entries
+        ]
+        self.config["prompt_templates"] = normalized
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            try:
+                await asyncio.to_thread(save_config)
+                logger.info("Bilibili 视频总结旧版模板配置已迁移到 template_list。")
+            except Exception as exc:
+                logger.warning("迁移 Bilibili 视频总结模板配置失败：%s", exc)
 
     async def terminate(self) -> None:
         async with self._jobs_lock:
@@ -634,6 +696,13 @@ class Main(star.Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._followup_lock:
+            followup_tasks = list(self._followup_tasks.values())
+            self._followup_tasks.clear()
+        for task in followup_tasks:
+            task.cancel()
+        if followup_tasks:
+            await asyncio.gather(*followup_tasks, return_exceptions=True)
         if self._client:
             await self._client.close()
         self._client = None
@@ -750,6 +819,129 @@ class Main(star.Star):
             template = fenced.group("template").strip()
         return template[:MAX_PROMPT_TEMPLATE_LENGTH]
 
+    def _configured_prompt_template_entries(self) -> list[dict[str, str]]:
+        """Read native template_list entries and legacy JSON templates."""
+        raw = self._config_value("prompt_templates", "")
+        if isinstance(raw, (dict, list)):
+            decoded: Any = raw
+        else:
+            text = str(raw or "").strip()
+            if not text:
+                return []
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("Bilibili 视频总结模板配置不是有效 JSON：%s", exc)
+                return []
+
+        candidates: list[tuple[Any, Any]] = []
+        if isinstance(decoded, dict):
+            candidates.extend(decoded.items())
+        elif isinstance(decoded, list):
+            for item in decoded:
+                if not isinstance(item, dict):
+                    continue
+                candidates.append(
+                    (
+                        item.get("name") or item.get("title"),
+                        item.get("prompt") or item.get("template"),
+                    )
+                )
+        else:
+            logger.warning("Bilibili 视频总结模板配置必须是 JSON 对象或数组")
+            return []
+
+        entries: list[dict[str, str]] = []
+        for raw_name, raw_prompt in candidates[:MAX_CONFIGURED_PROMPT_TEMPLATES]:
+            name = str(raw_name or "").strip()[:MAX_PROMPT_TEMPLATE_NAME_LENGTH]
+            prompt = self._clean_prompt_template(raw_prompt)
+            if name and prompt:
+                entries.append({"name": name, "prompt": prompt})
+        return entries
+
+    def _configured_prompt_templates(self) -> dict[str, str]:
+        return {
+            entry["name"]: entry["prompt"]
+            for entry in self._configured_prompt_template_entries()
+        }
+
+    async def _save_named_prompt_template(self, name: str, prompt: str) -> str:
+        name = str(name or "").strip()[:MAX_PROMPT_TEMPLATE_NAME_LENGTH]
+        prompt = self._clean_prompt_template(prompt)
+        if not name:
+            return "模板名称不能为空。"
+        if not prompt:
+            return "模板提示词不能为空。"
+
+        entries = self._configured_prompt_template_entries()
+        replaced = False
+        for entry in entries:
+            if entry["name"].casefold() == name.casefold():
+                entry["name"] = name
+                entry["prompt"] = prompt
+                replaced = True
+                break
+        if not replaced:
+            if len(entries) >= MAX_CONFIGURED_PROMPT_TEMPLATES:
+                return f"模板数量已达到上限（{MAX_CONFIGURED_PROMPT_TEMPLATES} 个）。"
+            entries.append({"name": name, "prompt": prompt})
+
+        saved_entries = [
+            {
+                "__template_key": "summary",
+                "name": entry["name"],
+                "prompt": entry["prompt"],
+            }
+            for entry in entries
+        ]
+        self.config["prompt_templates"] = saved_entries
+        save_config = getattr(self.config, "save_config", None)
+        if not callable(save_config):
+            return "当前配置对象不支持持久化，请在 WebUI 中手动保存模板。"
+        try:
+            await asyncio.to_thread(save_config)
+        except Exception as exc:
+            logger.warning("保存 Bilibili 视频总结模板失败：%s", exc)
+            return "模板已写入内存，但保存到配置文件失败，请检查 AstrBot 配置权限。"
+        action = "更新" if replaced else "新增"
+        return f"已{action}总结模板“{name}”。"
+
+    def _named_prompt_template(
+        self,
+        request: str,
+        templates: dict[str, str],
+    ) -> str:
+        if not request or not templates:
+            return ""
+        lowered_request = request.casefold()
+        if lowered_request.strip() in {name.casefold() for name in templates}:
+            for name, prompt in templates.items():
+                if name.casefold() == lowered_request.strip():
+                    return prompt
+        has_template_word = "模板" in request or "prompt" in lowered_request
+        if not has_template_word:
+            return ""
+        for name in sorted(templates, key=len, reverse=True):
+            if name.casefold() in lowered_request:
+                return templates[name]
+        return ""
+
+    def _resolve_prompt_template(
+        self,
+        user_request: str,
+        explicit_template: str = "",
+    ) -> str:
+        templates = self._configured_prompt_templates()
+        explicit = str(explicit_template or "").strip()
+        if explicit:
+            named = self._named_prompt_template(explicit, templates)
+            return named or self._clean_prompt_template(explicit)
+
+        named = self._named_prompt_template(user_request, templates)
+        if named:
+            return named
+        return self._extract_prompt_template(user_request)
+
     @classmethod
     def _extract_prompt_template(
         cls,
@@ -787,7 +979,7 @@ class Main(star.Star):
         user_request: str,
         prompt_template: str = "",
     ) -> str:
-        template = self._extract_prompt_template(user_request, prompt_template)
+        template = self._resolve_prompt_template(user_request, prompt_template)
         if not template:
             template = str(
                 self._config_value("summary_prompt", DEFAULT_SUMMARY_PROMPT)
@@ -840,6 +1032,161 @@ class Main(star.Star):
                 prompt_template,
             )
         )
+
+    def _followup_prompt(
+        self,
+        followup_context: FollowupContext,
+        question: str,
+    ) -> str:
+        transcript = followup_context.transcript
+        return (
+            "你正在回答用户对刚刚总结的 Bilibili 视频的追问。\n"
+            "请只依据视频信息、分P信息、全部字幕和已有总结回答。\n"
+            "如果资料中没有明确答案，请直接说明“视频资料中没有明确说明”，不要编造。\n"
+            "回答要直接、清晰，并针对用户的问题，不要重新输出整篇视频总结。\n\n"
+            f"【视频信息】\n{self._video_metadata_text(transcript)}\n\n"
+            f"【分P信息】\n{self._video_parts_text(transcript)}\n\n"
+            f"【已有总结】\n{followup_context.summary}\n\n"
+            f"【全部字幕】\n{self._subtitle_text(transcript)}\n\n"
+            f"【用户追问】\n{question.strip()}"
+        )
+
+    @staticmethod
+    def _is_followup_exit(message: str) -> bool:
+        return message.strip().casefold() in {
+            phrase.casefold() for phrase in FOLLOWUP_EXIT_PHRASES
+        }
+
+    @staticmethod
+    def _is_new_summary_request(message: str) -> bool:
+        text = str(message or "").strip()
+        if not (parse_video_identifier(text) or is_short_video_url(text)):
+            return False
+        return any(
+            keyword in text
+            for keyword in ("总结", "概括", "分析", "提炼", "复盘", "字幕")
+        )
+
+    async def _send_event_text(self, event: AstrMessageEvent, text: str) -> None:
+        sender = getattr(event, "send", None)
+        plain_result = getattr(event, "plain_result", None)
+        if callable(sender) and callable(plain_result):
+            await sender(plain_result(text))
+            return
+        target = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        await self._send_text(target, text)
+
+    def _requeue_event(self, event: AstrMessageEvent) -> bool:
+        get_event_queue = getattr(self.context, "get_event_queue", None)
+        if not callable(get_event_queue):
+            return False
+        queue = get_event_queue()
+        put_nowait = getattr(queue, "put_nowait", None)
+        if not callable(put_nowait):
+            return False
+        put_nowait(copy.copy(event))
+        stop_event = getattr(event, "stop_event", None)
+        if callable(stop_event):
+            stop_event()
+        return True
+
+    async def _handle_followup_event(
+        self,
+        controller: Any,
+        event: AstrMessageEvent,
+        followup_context: FollowupContext,
+    ) -> None:
+        question = str(getattr(event, "message_str", "") or "").strip()
+        if not question:
+            return
+        if self._is_followup_exit(question):
+            await self._send_event_text(event, "已结束当前视频追问，上下文已清除。")
+            controller.stop()
+            return
+
+        if self._is_new_summary_request(question):
+            controller.stop()
+            if not self._requeue_event(event):
+                await self._send_event_text(
+                    event,
+                    "已结束当前视频追问。请重新发送新视频总结请求。",
+                )
+            return
+
+        try:
+            await self._send_event_text(event, "正在根据刚才的视频内容回答你的追问。")
+            answer = await self._call_llm(
+                self._followup_prompt(followup_context, question)
+            )
+            await self._send_event_text(event, f"【Bilibili 视频追问】\n{answer}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Bilibili 视频追问失败：%s", exc)
+            await self._send_event_text(
+                event,
+                f"【Bilibili 视频追问】\n回答失败：{self._friendly_error(exc)}",
+            )
+        controller.keep(FOLLOWUP_TIMEOUT_SECONDS, reset_timeout=True)
+
+    async def _run_followup_waiter(
+        self,
+        target: str,
+        followup_context: FollowupContext,
+    ) -> None:
+        session_filter = DefaultSessionFilter()
+        FILTERS.append(session_filter)
+        waiter = SessionWaiter(session_filter, target, record_history_chains=False)
+
+        async def handle_event(controller: Any, event: AstrMessageEvent) -> None:
+            await self._handle_followup_event(
+                controller,
+                event,
+                followup_context,
+            )
+
+        try:
+            await waiter.register_wait(
+                handle_event,
+                timeout=FOLLOWUP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.info("Bilibili 视频追问上下文已过期：%s", target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Bilibili 视频追问会话失败：%s", exc)
+        finally:
+            with contextlib.suppress(ValueError):
+                FILTERS.remove(session_filter)
+            current = asyncio.current_task()
+            async with self._followup_lock:
+                if self._followup_tasks.get(target) is current:
+                    self._followup_tasks.pop(target, None)
+
+    async def _replace_followup_context(
+        self,
+        target: str,
+        transcript: VideoTranscript,
+        summary: str,
+    ) -> None:
+        async with self._followup_lock:
+            previous = self._followup_tasks.pop(target, None)
+        if previous and not previous.done():
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
+
+        task = asyncio.create_task(
+            self._run_followup_waiter(
+                target,
+                FollowupContext(transcript=transcript, summary=summary),
+            ),
+            name=f"bilibili-video-followup-{target}",
+        )
+        async with self._followup_lock:
+            self._followup_tasks[target] = task
+        # Register the SessionWaiter before the final message reaches the user.
+        await asyncio.sleep(0)
 
     async def _send_text(self, target: str, text: str) -> None:
         destination = str(target or "").strip()
@@ -923,7 +1270,14 @@ class Main(star.Star):
                 f"总时长：{format_duration(transcript.duration_seconds) or '未知'}\n"
                 f"分P：{len(transcript.pages)}，字幕轨道：{transcript.subtitle_count}\n\n"
             )
-            await self._send_text(target, header + summary)
+            await self._send_text(
+                target,
+                header
+                + summary
+                + "\n\n你可以继续直接追问这个视频，追问上下文保留 30 分钟。"
+                + "发送“结束追问”即可清除上下文。",
+            )
+            await self._replace_followup_context(target, transcript, summary)
             logger.info("Bilibili 视频总结已发送：%s", transcript.bvid)
         except asyncio.CancelledError:
             raise
@@ -1004,3 +1358,26 @@ class Main(star.Star):
             request_text,
             template_text,
         )
+
+    @filter.llm_tool(name="add_bilibili_summary_template")
+    async def add_bilibili_summary_template(
+        self,
+        event: AstrMessageEvent,
+        template_name: str,
+        prompt_template: str,
+    ) -> str:
+        """新增或更新一个 Bilibili 视频总结模板。
+
+        仅当管理员明确要求保存、新增或更新总结模板，并提供模板名称和完整提示词时调用。
+        普通用户不应调用此工具；普通的总结请求应调用 summarize_bilibili_video。
+
+        Args:
+            template_name(string): 要保存的模板名称，例如技术分析或直播复盘。
+            prompt_template(string): 完整提示词模板，可使用 {{video_title}}、{{video_parts}}、{{subtitles}} 等占位符。
+        """
+        if self._config_value("enabled", True) is not True:
+            return "Bilibili 视频总结工具当前已关闭。"
+        is_admin = getattr(event, "is_admin", None)
+        if not callable(is_admin) or not is_admin():
+            return "只有 AstrBot 管理员可以通过自然语言新增或更新总结模板。"
+        return await self._save_named_prompt_template(template_name, prompt_template)

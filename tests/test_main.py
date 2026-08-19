@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -47,11 +48,36 @@ def _install_astrbot_stubs() -> None:
     event_module.MessageChain = StubMessageChain
     event_module.filter = StubFilter
     astrbot_module.api = api_module
+    core_module = types.ModuleType("astrbot.core")
+    utils_module = types.ModuleType("astrbot.core.utils")
+    session_waiter_module = types.ModuleType("astrbot.core.utils.session_waiter")
+
+    class StubDefaultSessionFilter:
+        def filter(self, event):
+            return event.unified_msg_origin
+
+    class StubSessionWaiter:
+        def __init__(self, session_filter, session_id, record_history_chains=False):
+            self.session_filter = session_filter
+            self.session_id = session_id
+            self.handler = None
+            self.waiting = asyncio.Event()
+
+        async def register_wait(self, handler, timeout=30):
+            self.handler = handler
+            await self.waiting.wait()
+
+    session_waiter_module.FILTERS = []
+    session_waiter_module.DefaultSessionFilter = StubDefaultSessionFilter
+    session_waiter_module.SessionWaiter = StubSessionWaiter
     sys.modules.update(
         {
             "astrbot": astrbot_module,
             "astrbot.api": api_module,
             "astrbot.api.event": event_module,
+            "astrbot.core": core_module,
+            "astrbot.core.utils": utils_module,
+            "astrbot.core.utils.session_waiter": session_waiter_module,
         }
     )
 
@@ -164,6 +190,139 @@ def test_explicit_prompt_template_argument_overrides_natural_language():
     assert prompt == "只输出：测试视频 / 1P / 字幕内容"
 
 
+def test_named_prompt_templates_can_be_selected_from_natural_language():
+    plugin = _make_main(
+        {
+            "provider_id": "provider-1",
+            "prompt_templates": (
+                '{"技术分析": "技术：{{video_title}}\\n{{subtitles}}", '
+                '"技术分析详细": "详细：{{video_description}}\\n{{subtitles}}"}'
+            ),
+        }
+    )
+    transcript = _transcript("技术字幕")
+
+    prompt = plugin._summary_prompt(transcript, "技术字幕", "使用技术分析模板总结")
+
+    assert prompt == "技术：测试视频\n技术字幕"
+    assert plugin._summary_prompt(transcript, "技术字幕", "技术分析") == prompt
+
+    detailed_prompt = plugin._summary_prompt(
+        transcript,
+        "技术字幕",
+        "请使用技术分析详细模板总结",
+    )
+    assert detailed_prompt == "详细：视频简介\n技术字幕"
+
+
+def test_named_prompt_templates_support_array_configuration():
+    plugin = _make_main(
+        {
+            "provider_id": "provider-1",
+            "prompt_templates": (
+                '[{"name":"短摘要","prompt":"{{video_title}}：{{subtitles}}"}]'
+            ),
+        }
+    )
+
+    prompt = plugin._summary_prompt(_transcript(), "字幕内容", "用短摘要模板")
+
+    assert prompt == "测试视频：字幕内容"
+
+
+def test_unselected_named_templates_do_not_replace_generic_prompt():
+    plugin = _make_main(
+        {
+            "provider_id": "provider-1",
+            "prompt_templates": '{"技术分析":"只输出技术结论：{{subtitles}}"}',
+        }
+    )
+
+    prompt = plugin._summary_prompt(_transcript(), "字幕内容", "重点关注故事情节")
+
+    assert "请根据以下 Bilibili 视频信息和全部字幕生成总结" in prompt
+    assert "重点关注故事情节" in prompt
+
+
+@pytest.mark.asyncio
+async def test_admin_can_add_and_update_native_prompt_template():
+    class ConfigDict(dict):
+        def __init__(self):
+            super().__init__({"provider_id": "provider-1", "prompt_templates": []})
+            self.save_calls = 0
+
+        def save_config(self):
+            self.save_calls += 1
+
+    config = ConfigDict()
+    plugin = _make_main(config)
+    event = SimpleNamespace(is_admin=lambda: True)
+
+    result = await plugin.add_bilibili_summary_template(
+        event,
+        "技术分析",
+        "请分析：{{subtitles}}",
+    )
+
+    assert result == "已新增总结模板“技术分析”。"
+    assert config["prompt_templates"] == [
+        {
+            "__template_key": "summary",
+            "name": "技术分析",
+            "prompt": "请分析：{{subtitles}}",
+        }
+    ]
+    assert config.save_calls == 1
+
+    update_result = await plugin.add_bilibili_summary_template(
+        event,
+        "技术分析",
+        "只输出结论：{{subtitles}}",
+    )
+    assert update_result == "已更新总结模板“技术分析”。"
+    assert config["prompt_templates"][0]["prompt"] == "只输出结论：{{subtitles}}"
+    assert config.save_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_add_prompt_template():
+    plugin = _make_main()
+    event = SimpleNamespace(is_admin=lambda: False)
+
+    result = await plugin.add_bilibili_summary_template(
+        event,
+        "不允许",
+        "{{subtitles}}",
+    )
+
+    assert "只有 AstrBot 管理员" in result
+
+
+@pytest.mark.asyncio
+async def test_legacy_prompt_templates_are_migrated_to_native_shape():
+    class ConfigDict(dict):
+        def __init__(self):
+            super().__init__(
+                {
+                    "provider_id": "provider-1",
+                    "prompt_templates": '{"简短摘要":"只保留要点：{{subtitles}}"}',
+                }
+            )
+            self.save_calls = 0
+
+        def save_config(self):
+            self.save_calls += 1
+
+    config = ConfigDict()
+    plugin = _make_main(config)
+
+    await plugin._migrate_prompt_template_config()
+
+    assert config["prompt_templates"][0]["__template_key"] == "summary"
+    assert config["prompt_templates"][0]["name"] == "简短摘要"
+    assert config.save_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_summarize_sends_all_subtitles_in_one_llm_request():
     class FakeContext:
@@ -235,12 +394,131 @@ async def test_job_sends_final_summary_to_current_session():
     )
     plugin._summarize = AsyncMock(return_value="最终总结")
     plugin._send_progress = AsyncMock()
+    plugin._replace_followup_context = AsyncMock()
 
     await plugin._run_job("job", "platform:group", "BV1xx411c7mD", "")
 
     assert send_message.await_args.args[0] == "platform:group"
     assert "最终总结" in send_message.await_args.args[1].chain[0]
     assert "job" not in plugin._jobs
+
+
+@pytest.mark.asyncio
+async def test_followup_uses_full_video_context_and_refreshes_session():
+    send_message = AsyncMock(return_value=True)
+
+    class Controller:
+        def __init__(self):
+            self.keep_calls = []
+            self.stop_calls = 0
+
+        def keep(self, *args, **kwargs):
+            self.keep_calls.append((args, kwargs))
+
+        def stop(self):
+            self.stop_calls += 1
+
+    class Event:
+        unified_msg_origin = "platform:group"
+        message_str = "第三个方案是什么？"
+
+    context = SimpleNamespace(send_message=send_message)
+    plugin = _make_main(context=context)
+    plugin._call_llm = AsyncMock(return_value="第三个方案是测试方案。")
+
+    await plugin._handle_followup_event(
+        Controller(),
+        Event(),
+        main.FollowupContext(_transcript("完整字幕内容"), "已有总结内容"),
+    )
+
+    assert plugin._call_llm.await_count == 1
+    prompt = plugin._call_llm.await_args.args[0]
+    assert "完整字幕内容" in prompt
+    assert "已有总结内容" in prompt
+    assert "第三个方案是什么？" in prompt
+    assert "第三个方案是测试方案。" in send_message.await_args.args[1].chain[0]
+
+
+@pytest.mark.asyncio
+async def test_followup_exit_clears_session_without_calling_llm():
+    send_message = AsyncMock(return_value=True)
+
+    class Controller:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    event = SimpleNamespace(
+        unified_msg_origin="platform:group",
+        message_str="结束追问",
+    )
+    plugin = _make_main(context=SimpleNamespace(send_message=send_message))
+    plugin._call_llm = AsyncMock()
+    controller = Controller()
+
+    await plugin._handle_followup_event(
+        controller,
+        event,
+        main.FollowupContext(_transcript(), "已有总结"),
+    )
+
+    plugin._call_llm.assert_not_awaited()
+    assert controller.stop_calls == 1
+    assert "上下文已清除" in send_message.await_args.args[1].chain[0]
+
+
+@pytest.mark.asyncio
+async def test_new_video_followup_is_requeued_for_normal_summary_flow():
+    class Controller:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+    queued = []
+
+    class Queue:
+        def put_nowait(self, event):
+            queued.append(event)
+
+    event = SimpleNamespace(
+        unified_msg_origin="platform:group",
+        message_str="请总结 BV1xx411c7mD",
+        stop_event=lambda: None,
+    )
+    context = SimpleNamespace(get_event_queue=lambda: Queue())
+    plugin = _make_main(context=context)
+    controller = Controller()
+
+    await plugin._handle_followup_event(
+        controller,
+        event,
+        main.FollowupContext(_transcript(), "已有总结"),
+    )
+
+    assert controller.stop_calls == 1
+    assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminate_cleans_up_followup_waiter_task():
+    plugin = _make_main()
+
+    await plugin._replace_followup_context(
+        "platform:group",
+        _transcript("需要清理的字幕"),
+        "已有总结",
+    )
+    assert "platform:group" in plugin._followup_tasks
+
+    await plugin.terminate()
+
+    assert not plugin._followup_tasks
+    assert not main.FILTERS
 
 
 def test_friendly_error_explains_model_gateway_timeout():
@@ -252,4 +530,7 @@ def test_no_chat_command_is_registered():
     assert not hasattr(main.Main, "bili_summary_video")
     assert getattr(main.Main.summarize_bilibili_video, "llm_tool_name") == (
         "summarize_bilibili_video"
+    )
+    assert getattr(main.Main.add_bilibili_summary_template, "llm_tool_name") == (
+        "add_bilibili_summary_template"
     )

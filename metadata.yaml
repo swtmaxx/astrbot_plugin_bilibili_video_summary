@@ -3,9 +3,9 @@ display_name: Bilibili 视频总结
 short_desc: 通过自然语言提取 Bilibili 视频全部分P字幕并生成总结。
 desc: 通过自然语言提取 Bilibili 视频全部分P字幕并生成总结。
 author: swtmaxx
-version: 1.1.0
+version: 1.4.0
 repo: https://github.com/swtmaxx/astrbot_plugin_bilibili_video_summary
-astrbot_version: ">=4.5.7"
+astrbot_version: ">=4.10.4"
 tags:
   - bilibili
   - summary
