@@ -37,6 +37,20 @@ DEFAULT_SUMMARY_PROMPT = (
     "必须以字幕和视频信息为依据，不要补写没有依据的事实，也不要逐句复述字幕。"
 )
 PROMPT_PLACEHOLDER_RE = re.compile(r"\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}")
+PROMPT_TEMPLATE_MARKER_RE = re.compile(
+    r"(?:请\s*)?(?:使用|按照|根据|采用|按|用)\s*"
+    r"(?:以下|下面|这个|该)?\s*(?:自定义)?"
+    r"(?:提示词模板|总结模板|模板)\s*(?:来|进行)?\s*"
+    r"(?:总结)?\s*[：:]\s*(?P<template>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+PROMPT_TEMPLATE_SIMPLE_MARKER_RE = re.compile(
+    r"(?:^|[\n。；])\s*(?:提示词模板|总结模板|模板)\s*"
+    r"(?:是|为|如下)?\s*[：:]\s*(?P<template>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+PROMPT_TEMPLATE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(?P<template>.*?)```", re.DOTALL)
+MAX_PROMPT_TEMPLATE_LENGTH = 8000
 
 # Bilibili's documented WBI mixin-key permutation.
 WBI_MIXIN_KEY_TABLE = [
@@ -726,15 +740,58 @@ class Main(star.Star):
             template,
         )
 
+    @staticmethod
+    def _clean_prompt_template(value: Any) -> str:
+        template = str(value or "").strip()
+        if not template:
+            return ""
+        fenced = PROMPT_TEMPLATE_FENCE_RE.search(template)
+        if fenced:
+            template = fenced.group("template").strip()
+        return template[:MAX_PROMPT_TEMPLATE_LENGTH]
+
+    @classmethod
+    def _extract_prompt_template(
+        cls,
+        user_request: str,
+        explicit_template: str = "",
+    ) -> str:
+        """Find a per-request template without treating every extra request as one."""
+        direct = cls._clean_prompt_template(explicit_template)
+        if direct:
+            return direct
+
+        request = str(user_request or "").strip()
+        if not request:
+            return ""
+
+        fenced = PROMPT_TEMPLATE_FENCE_RE.search(request)
+        if fenced and ("{{" in fenced.group("template") or "模板" in request):
+            return cls._clean_prompt_template(fenced.group("template"))
+
+        match = PROMPT_TEMPLATE_MARKER_RE.search(request)
+        if not match:
+            match = PROMPT_TEMPLATE_SIMPLE_MARKER_RE.search(request)
+        if match:
+            return cls._clean_prompt_template(match.group("template"))
+
+        # A request containing supported placeholders is already a usable template.
+        if "{{subtitles}}" in request or "{{video_" in request:
+            return cls._clean_prompt_template(request)
+        return ""
+
     def _summary_prompt(
         self,
         transcript: VideoTranscript,
         subtitles: str,
         user_request: str,
+        prompt_template: str = "",
     ) -> str:
-        template = str(
-            self._config_value("summary_prompt", DEFAULT_SUMMARY_PROMPT)
-        ).strip() or DEFAULT_SUMMARY_PROMPT
+        template = self._extract_prompt_template(user_request, prompt_template)
+        if not template:
+            template = str(
+                self._config_value("summary_prompt", DEFAULT_SUMMARY_PROMPT)
+            ).strip() or DEFAULT_SUMMARY_PROMPT
         values = {
             "video_bvid": transcript.bvid,
             "video_aid": str(transcript.aid),
@@ -769,13 +826,19 @@ class Main(star.Star):
         self,
         transcript: VideoTranscript,
         user_request: str = "",
+        prompt_template: str = "",
     ) -> str:
         """Send every available subtitle to exactly one model request."""
         subtitles = self._subtitle_text(transcript)
         if not subtitles:
             raise SubtitleExtractionError("视频没有可用字幕")
         return await self._call_llm(
-            self._summary_prompt(transcript, subtitles, user_request)
+            self._summary_prompt(
+                transcript,
+                subtitles,
+                user_request,
+                prompt_template,
+            )
         )
 
     async def _send_text(self, target: str, text: str) -> None:
@@ -825,6 +888,7 @@ class Main(star.Star):
         target: str,
         video_input: str,
         user_request: str,
+        prompt_template: str = "",
     ) -> None:
         try:
             await self._send_progress(target, "已接受请求，正在解析视频链接。")
@@ -844,7 +908,11 @@ class Main(star.Star):
                 target,
                 f"字幕读取完成：{len(transcript.pages)} 个分P、{transcript.subtitle_count} 条字幕轨道，正在生成总结。",
             )
-            summary = await self._summarize(transcript, user_request)
+            summary = await self._summarize(
+                transcript,
+                user_request,
+                prompt_template,
+            )
             published = format_timestamp(transcript.published_at)
             header = (
                 "【Bilibili 视频总结】\n"
@@ -873,6 +941,7 @@ class Main(star.Star):
         target: str,
         video_input: str,
         user_request: str,
+        prompt_template: str = "",
     ) -> str:
         normalized = parse_video_identifier(video_input) or video_input.strip().lower()
         job_key = f"{target}\0{normalized}"
@@ -887,7 +956,13 @@ class Main(star.Star):
             if active_count >= max_jobs:
                 return "当前视频总结任务已达到并发上限，请稍后再试。"
             self._jobs[job_key] = asyncio.create_task(
-                self._run_job(job_key, target, video_input, user_request),
+                self._run_job(
+                    job_key,
+                    target,
+                    video_input,
+                    user_request,
+                    prompt_template,
+                ),
                 name=f"bilibili-video-summary-{normalized}",
             )
         return "已开始在当前会话处理这个 Bilibili 视频，完成后会发送总结。"
@@ -898,6 +973,7 @@ class Main(star.Star):
         event: AstrMessageEvent,
         video_url: str,
         user_request: str = "",
+        prompt_template: str = "",
     ) -> str:
         """总结用户明确要求总结的 Bilibili 视频。
 
@@ -907,7 +983,8 @@ class Main(star.Star):
 
         Args:
             video_url(string): 用户提供的 Bilibili BV号、AV号、视频链接或 b23.tv 短链接。
-            user_request(string): 用户对总结内容或格式的额外要求，可为空。
+            user_request(string): 用户对总结内容或格式的额外要求；如果用户说“使用以下模板”，也将从这里识别本次模板。
+            prompt_template(string): 用户明确提供的本次总结模板，可为空。模板支持 {{video_title}}、{{video_parts}}、{{subtitles}} 等占位符。
         """
         if self._config_value("enabled", True) is not True:
             return "Bilibili 视频总结工具当前已关闭。"
@@ -920,4 +997,10 @@ class Main(star.Star):
         if not parse_video_identifier(video_url) and not is_short_video_url(video_url):
             return "无法识别视频链接，请提供 Bilibili BV号、AV号、标准视频链接或 b23.tv 短链接。"
         request_text = str(user_request or "").strip()[:2000]
-        return await self._start_job(target, str(video_url).strip(), request_text)
+        template_text = str(prompt_template or "").strip()[:MAX_PROMPT_TEMPLATE_LENGTH]
+        return await self._start_job(
+            target,
+            str(video_url).strip(),
+            request_text,
+            template_text,
+        )

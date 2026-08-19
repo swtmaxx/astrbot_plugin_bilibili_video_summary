@@ -16,7 +16,7 @@
 
 - `provider_id`：用于生成总结的已启用模型提供商，模型需要支持 Function Calling。
 - `sessdata`：可选的 Bilibili 登录 Cookie。可以填写纯 SESSDATA 值，也可以粘贴完整 Cookie；遇到 `-352`、`-412` 风控或受限字幕时配置有效值。
-- `summary_prompt`：完整自定义提示词模板。插件不会额外追加固定 system prompt。
+- `summary_prompt`：可选的默认提示词模板。留空时使用内置通用提示词；自然语言请求可以临时覆盖它。
 - `request_interval_seconds`：Bilibili 请求间隔。
 - `request_timeout_seconds`：单次 Bilibili 请求超时，范围为 1 到 300 秒。
 - `max_concurrent_jobs`：后台任务并发数，默认 1。
@@ -42,6 +42,25 @@ SESSDATA 属于敏感凭据，请只通过 WebUI 配置，不要写入日志、�
 ```
 
 未知占位符会保持原样。全部字幕只会放入一次模型请求；视频过长导致模型上下文不足或模型网关超时后，插件会明确提示失败，不会静默截断或改用分段总结。
+
+## 自然语言指定模板
+
+普通的额外要求不会替换默认通用提示词，例如：
+
+```text
+总结这个视频，重点关注技术结论和最终建议。
+```
+
+需要临时指定完整模板时，可以直接说：
+
+```text
+总结这个视频，请使用以下模板：
+标题：{{video_title}}
+发布时间：{{video_published_at}}
+核心内容：{{subtitles}}
+```
+
+也支持“按照下面的总结模板”“模板：……”等自然语言表达。识别到模板后，仅当前任务使用该模板，不会修改 WebUI 中的默认配置。模板没有填写占位符时，插件会把它原样作为提示词发送给模型；使用 `{{subtitles}}`、`{{video_metadata}}`、`{{video_parts}}` 等占位符即可插入对应视频信息。
 
 ## 工作流程
 

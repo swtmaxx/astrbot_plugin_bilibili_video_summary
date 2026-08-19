@@ -126,6 +126,44 @@ def test_prompt_contains_all_metadata_and_full_subtitles():
     assert "{{subtitles}}" not in prompt
 
 
+def test_plain_request_keeps_the_default_generic_template():
+    plugin = _make_main()
+    transcript = _transcript()
+
+    prompt = plugin._summary_prompt(transcript, "字幕内容", "重点关注技术结论")
+
+    assert "请根据以下 Bilibili 视频信息和全部字幕生成总结" in prompt
+    assert "重点关注技术结论" in prompt
+
+
+def test_natural_language_template_overrides_default_and_renders_placeholders():
+    plugin = _make_main()
+    transcript = _transcript("完整字幕")
+
+    prompt = plugin._summary_prompt(
+        transcript,
+        "完整字幕",
+        "请使用以下模板总结：\n标题：{{video_title}}\n内容：{{subtitles}}",
+    )
+
+    assert prompt == "标题：测试视频\n内容：完整字幕"
+    assert "请根据以下 Bilibili 视频信息和全部字幕生成总结" not in prompt
+
+
+def test_explicit_prompt_template_argument_overrides_natural_language():
+    plugin = _make_main()
+    transcript = _transcript()
+
+    prompt = plugin._summary_prompt(
+        transcript,
+        "字幕内容",
+        "请重点分析技术细节",
+        "只输出：{{video_title}} / {{part_count}}P / {{subtitles}}",
+    )
+
+    assert prompt == "只输出：测试视频 / 1P / 字幕内容"
+
+
 @pytest.mark.asyncio
 async def test_summarize_sends_all_subtitles_in_one_llm_request():
     class FakeContext:

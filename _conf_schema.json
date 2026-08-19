@@ -18,8 +18,8 @@
   },
   "summary_prompt": {
     "type": "text",
-    "description": "完整自定义总结提示词模板",
-    "hint": "插件不会额外添加固定 system prompt；全部字幕会一次性替换到 {{subtitles}}。支持 {{video_title}}、{{video_description}}、{{video_published_at}}、{{video_duration}}、{{video_parts}}、{{subtitles}} 和 {{user_request}} 等占位符。",
+    "description": "默认总结提示词模板（可选）",
+    "hint": "留空时使用内置通用提示词。也可以直接在自然语言请求中说“使用以下模板总结：……”，仅本次任务临时覆盖此配置。支持 {{video_title}}、{{video_description}}、{{video_published_at}}、{{video_duration}}、{{video_parts}}、{{subtitles}} 和 {{user_request}} 等占位符。",
     "default": "请根据以下 Bilibili 视频信息和全部字幕生成总结。\n\n用户额外要求：{{user_request}}\n\n视频信息：\n{{video_metadata}}\n\n视频分P：\n{{video_parts}}\n\n全部字幕：\n{{subtitles}}\n\n请用中文输出视频主题、主要内容、重要结论和待办事项，使用清晰的小标题。必须以字幕和视频信息为依据，不要补写没有依据的事实，也不要逐句复述字幕。"
   },
   "request_interval_seconds": {
